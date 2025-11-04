@@ -1,0 +1,315 @@
+Reviewing the codebase to understand the architecture and explain the system:
+
+
+[4 tools called]
+
+# Multi-Tenant Notification Engine: Overview
+
+## What it is
+
+A real-time notification system that sends notifications to users across multiple tenants (hackathons). It supports:
+- Multi-tenancy: separate data and queues per tenant
+- Real-time delivery via WebSockets (Socket.io)
+- Horizontal scaling with workers
+- Reliability: retries, backpressure, and delivery tracking
+
+## Architecture and flow
+
+### Components
+
+1. Main API Server (`index.js`)
+   - Receives notification requests
+   - Manages WebSocket connections
+   - Queues jobs for processing
+
+2. Worker Process (`worker.js`)
+   - Processes jobs from queues
+   - Delivers notifications via Socket.io
+   - Handles fan-out to multiple users
+
+3. Frontend (`App.js`)
+   - React UI that connects to the server
+   - Receives real-time notifications
+   - Can trigger test notifications
+
+### Data flow
+
+```
+1. API Request → POST /notify/:hackathonId
+   ↓
+2. Save to PostgreSQL (persistence)
+   ↓
+3. Add job to BullMQ queue (tenant-specific queue)
+   ↓
+4. Worker picks up job from queue
+   ↓
+5. Worker queries database for users in that tenant
+   ↓
+6. Worker fans-out notification via Socket.io to all users
+   ↓
+7. Redis Stream for backpressure/retry handling
+   ↓
+8. Redis Pub/Sub for delivery acknowledgments
+```
+
+### Technology stack
+
+- PostgreSQL: persistent storage
+- Redis: queue (BullMQ), pub/sub, streams
+- Socket.io: real-time WebSocket communication
+- BullMQ: job queue with retries
+- Express: REST API
+
+## Design philosophy
+
+### 1. Tenant isolation (multi-tenancy)
+```javascript
+// Each hackathon gets its own queue
+queues[hackathonId] = new Queue(`notifications-${hackathonId}`, ...)
+```
+- Separate queues per tenant
+- Data partitioned by `hackathon_id`
+- Prevents one tenant from affecting others
+
+### 2. Horizontal scalability
+- API server: stateless, can run multiple instances
+- Workers: can scale independently
+- Redis adapter: enables Socket.io across processes
+
+### 3. Resilience and reliability
+- Retry logic: exponential backoff (3 attempts)
+- Backpressure: Redis Streams for handling spikes
+- Delivery tracking: ACKs via Redis pub/sub
+- Job persistence: BullMQ stores jobs in Redis
+
+### 4. Performance optimization
+- Async processing: jobs queued, not blocking API
+- Fan-out pattern: one notification to many users efficiently
+- Connection pooling: PostgreSQL connection pool
+- Concurrency: 20 parallel fan-outs per worker
+
+### 5. Separation of concerns
+```
+API Server (index.js)    →  Receives requests, manages connections
+Worker Process (worker.js) →  Processes jobs, delivers notifications
+Database (PostgreSQL)    →  Persistent storage
+Queue (BullMQ/Redis)      →  Job processing
+Pub/Sub (Redis)          →  Cross-process communication
+```
+
+### 6. Real-time first
+- WebSocket connections for instant delivery
+- Socket.io rooms for tenant-based grouping
+- Redis adapter for multi-server support
+
+## Patterns used
+
+1. Producer-consumer: API produces jobs, workers consume
+2. Fan-out: one notification → many users
+3. Pub/sub: delivery acknowledgments
+4. Queue sharding: per-tenant queues
+5. Worker pool: multiple workers can process jobs
+
+## Why this design
+
+- Scalability: add workers as load increases
+- Reliability: retries and error handling
+- Isolation: tenants don’t affect each other
+- Performance: async processing, non-blocking API
+- Real-time: immediate delivery via WebSockets
+- Observability: delivery tracking and logging
+
+## Example scenario
+
+1. Hackathon organizer sends a deadline notification
+2. API saves it to the database
+3. Job is queued in `notifications-ethindia-2024`
+4. Worker picks up the job
+5. Worker queries users in `ethindia-2024`
+6. Worker sends via Socket.io to all connected users
+7. Frontend receives and displays the notification
+
+This architecture supports many users, tenants, and high notification volumes while maintaining isolation and reliability.
+
+
+
+
+
+
+
+Locating the exact code sections for each part:
+
+
+[2 tools called]
+
+Where each part is implemented in the code:
+
+1) Multi-tenancy: separate data and queues per tenant
+
+Queue creation (per-tenant queues):
+```24:31:notification-engine-backend/index.js
+// Tenant-sharded queues (one per hackathon)
+const queues = {};
+function getQueue(hackathonId) {
+  if (!queues[hackathonId]) {
+    queues[hackathonId] = new Queue(`notifications-${hackathonId}`, { connection: pubClient });
+  }
+  return queues[hackathonId];
+}
+```
+- Each tenant gets its own queue: `notifications-ethindia-2024`, `notifications-tinkerquest-2025`, etc.
+
+Database queries (tenant-scoped):
+```80:83:notification-engine-backend/index.js
+  // Save to DB
+  const { rows } = await pool.query(
+    'INSERT INTO notifications (hackathon_id, message, type) VALUES ($1, $2, $3) RETURNING id',
+    [hackathonId, message, type]
+  );
+```
+- All notifications include `hackathon_id` for tenant isolation.
+
+```60:63:notification-engine-backend/index.js
+    // Send initial unread notifications
+    const { rows } = await pool.query(
+      'SELECT * FROM notifications WHERE hackathon_id = $1 ORDER BY sent_at DESC LIMIT 10',
+      [hackathonId]
+    );
+```
+- Queries filter by `hackathon_id`.
+
+2) Add job to BullMQ queue (tenant-specific queue)
+
+```74:94:notification-engine-backend/index.js
+// === API: Add Notification (queues it) ===
+app.post('/notify/:hackathonId', async (req, res) => {
+  const { hackathonId } = req.params;
+  const { message, type = 'deadline' } = req.body;
+
+  // Save to DB
+  const { rows } = await pool.query(
+    'INSERT INTO notifications (hackathon_id, message, type) VALUES ($1, $2, $3) RETURNING id',
+    [hackathonId, message, type]
+  );
+  const notificationId = rows[0].id;
+
+  // Queue for fan-out (tenant-sharded)
+  const queue = getQueue(hackathonId);
+  await queue.add('send-notification', { notificationId, hackathonId, message, type }, {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 1000 },
+  });
+
+  res.json({ success: true, notificationId });
+});
+```
+- `getQueue(hackathonId)` returns the tenant-specific queue.
+- `queue.add()` enqueues the job with retry settings.
+
+3) Worker queries database for users in that tenant
+
+```44:48:notification-engine-backend/worker.js
+      // Get users in this tenant
+      const { rows: users } = await pool.query(
+        'SELECT socket_id FROM users WHERE hackathon_id = $1',
+        [hackathonId]
+      );
+```
+- Filters users by `hackathon_id` to get the tenant's users.
+
+4) Worker fans-out notification via Socket.io to all users
+
+```52:61:notification-engine-backend/worker.js
+      // Fan-out via Socket.io (only to this room)
+      users.forEach(user => {
+        if (user.socket_id) {
+          io.to(hackathonId).to(user.socket_id).emit('notification:received', {
+            id: notificationId,
+            message,
+            type
+          });
+        }
+      });
+```
+- `io.to(hackathonId)` targets the tenant room.
+- `io.to(user.socket_id)` targets a specific user.
+- `emit()` sends the notification to all matching sockets.
+
+5) Redis Stream for backpressure/retry handling
+
+```28:37:notification-engine-backend/worker.js
+// Consumer for each stream (backpressure via consumer groups)
+const hackathons = ['ethindia-2024', 'tinkerquest-2025'];  // Expand as needed
+
+console.log('Starting notification workers...');
+hackathons.forEach(hackathonId => {
+  const streamKey = `notifications:${hackathonId}`;
+  const consumerGroup = `fanout-group-${hackathonId}`;
+
+  // Create consumer group if not exists
+  redis.xgroup('CREATE', streamKey, consumerGroup, '$', 'MKSTREAM').catch(() => {});
+```
+- Creates a Redis Stream per tenant for backpressure.
+
+```63:64:notification-engine-backend/worker.js
+      // Add to stream for backpressure/retry (consumer groups handle pending)
+      await redis.xadd(streamKey, '*', 'notificationId', notificationId, 'hackathonId', hackathonId);
+```
+- Adds notification events to the stream for tracking and retry.
+
+6) Redis Pub/Sub for delivery acknowledgments
+
+Publisher (worker publishes):
+```66:67:notification-engine-backend/worker.js
+      // ACK (update delivered)
+      await redis.publish('notifications:delivered', JSON.stringify({ notificationId, hackathonId, userId: users.length }));
+```
+- Publishes delivery confirmation after fan-out.
+
+Subscriber (main server listens):
+```33:43:notification-engine-backend/index.js
+// === Shared Subscriber for Streams (backpressure via consumer groups) ===
+const subscriber = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null });
+subscriber.subscribe('notifications:delivered');  // For ACKs
+subscriber.on('message', async (channel, message) => {
+  const { hackathonId, notificationId, userId } = JSON.parse(message);
+  // Update delivered count
+  await pool.query(
+    'UPDATE notifications SET delivered_count = delivered_count + 1 WHERE id = $1 AND hackathon_id = $2',
+    [notificationId, hackathonId]
+  );
+});
+```
+- Subscribes to the channel and updates the database when delivery is confirmed.
+
+Visual flow with code references:
+
+```
+1. POST /notify/:hackathonId  [index.js:75]
+   ↓
+2. Save to DB with hackathon_id  [index.js:80-83]
+   ↓
+3. Get tenant-specific queue  [index.js:87]
+   ↓
+4. Add job to BullMQ queue  [index.js:88-91]
+   ↓
+5. Worker picks up job  [worker.js:39]
+   ↓
+6. Query users for this tenant  [worker.js:45-48]
+   ↓
+7. Fan-out via Socket.io  [worker.js:53-61]
+   ↓
+8. Add to Redis Stream  [worker.js:64]
+   ↓
+9. Publish ACK via Pub/Sub  [worker.js:67]
+   ↓
+10. Subscriber updates DB  [index.js:36-42]
+```
+
+Summary:
+- Multi-tenancy: `getQueue(hackathonId)` creates per-tenant queues; DB queries filter by `hackathon_id`.
+- Queue job: `queue.add()` in `index.js:88`.
+- Query users: `worker.js:45-48` filters by `hackathon_id`.
+- Fan-out: `worker.js:53-61` emits to the tenant room and specific users.
+- Redis Stream: `worker.js:37` creates streams; `worker.js:64` writes events.
+- Pub/Sub: `worker.js:67` publishes; `index.js:35-42` subscribes and updates the DB.
