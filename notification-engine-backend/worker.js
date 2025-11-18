@@ -30,11 +30,11 @@ const hackathons = ['ethindia-2024', 'tinkerquest-2025'];  // Expand as needed
 
 console.log('Starting notification workers...');
 hackathons.forEach(hackathonId => {
-  const streamKey = `notifications:${hackathonId}`;
-  const consumerGroup = `fanout-group-${hackathonId}`;
+  // const streamKey = `notifications:${hackathonId}`;
+  // const consumerGroup = `fanout-group-${hackathonId}`;
 
   // Create consumer group if not exists
-  redis.xgroup('CREATE', streamKey, consumerGroup, '$', 'MKSTREAM').catch(() => {});
+  // redis.xgroup('CREATE', streamKey, consumerGroup, '$', 'MKSTREAM').catch(() => {});
 
   
 
@@ -65,7 +65,7 @@ hackathons.forEach(hackathonId => {
       });
 
       // Add to stream for backpressure/retry (consumer groups handle pending)
-      await redis.xadd(streamKey, '*', 'notificationId', notificationId, 'hackathonId', hackathonId);
+      // await redis.xadd(streamKey, '*', 'notificationId', notificationId, 'hackathonId', hackathonId);
 
       // ACK (update delivered)
       await redis.publish('notifications:delivered', JSON.stringify({ notificationId, hackathonId, userId: users.length }));
