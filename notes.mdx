@@ -1,7 +1,4 @@
-Reviewing the codebase to understand the architecture and explain the system:
 
-
-[4 tools called]
 
 # Multi-Tenant Notification Engine: Overview
 
@@ -137,12 +134,8 @@ This architecture supports many users, tenants, and high notification volumes wh
 
 
 
-Locating the exact code sections for each part:
 
 
-[2 tools called]
-
-Where each part is implemented in the code:
 
 1) Multi-tenancy: separate data and queues per tenant
 
@@ -317,8 +310,43 @@ Summary:
 
 
 
+- The snippet is documenting how each tenant (per hackathon) gets its own Redis Stream and consumer group so notifications can be replayed and throttled independently. In `worker.js`, the worker loop enumerates hackathons, sets a `streamKey` like `notifications:ethindia-2024`, and ensures a consumer group exists via `xgroup('CREATE', ...)`. This means every notification fan-out for that tenant is tracked in a persistent stream rather than fire-and-forget pub/sub.
+
+```
+28:38:Multi-Tenant-Notification-Engine/notification-engine-backend/worker.js
+const hackathons = ['ethindia-2024', 'tinkerquest-2025'];
+...
+redis.xgroup('CREATE', streamKey, consumerGroup, '$', 'MKSTREAM').catch(() => {});
+```
+
+- Redis Streams are an append-only log inside Redis. Every `xadd` appends an entry with fields you pick (here `notificationId`, `hackathonId`). Because it’s log-based, consumer groups can keep track of which entries each worker has acknowledged. If a worker crashes before ACKing, Redis keeps the pending entry so another consumer can retry. That’s why the note mentions “backpressure via consumer groups”: the stream only advances once consumers move their cursor forward.
+
+```
+67:70:Multi-Tenant-Notification-Engine/notification-engine-backend/worker.js
+await redis.xadd(streamKey, '*', 'notificationId', notificationId, 'hackathonId', hackathonId);
+```
+
+- Why this matters in the notification engine: Socket fan-out can briefly overwhelm clients or fail if sockets disconnect. By writing every notification to a per-tenant stream, you gain:
+  - replay: you can re-deliver missed notifications or build dashboards from historical entries;
+  - isolation: one noisy tenant’s backlog doesn’t block others because each has its own stream/consumer group;
+  - durability/backpressure: if workers fall behind, the stream length grows, but no events are lost, and consumers catch up when ready instead of dropping messages;
+  - retries: failed jobs can be re-claimed from the pending list the consumer group tracks.
+
+- In short, Redis Streams provide an ordered, durable queue with built-in tracking for multiple workers. The code records every fan-out so you can retry, audit, and throttle per tenant, which pure pub/sub or simple Socket.io broadcasting can’t offer.
 
 
+Think of a Redis Stream as the log itself and consumer groups as how you read it:
+
+- **Stream (`streamKey`)**: one append-only log per tenant such as `notifications:ethindia-2024`. Every `xadd` appends an entry (notification payload). The stream doesn’t care who reads it; it just retains ordered records.
+
+- **Consumer group (`fanout-group-ethindia-2024`)**: a named reader pool for that stream. The group keeps cursors and “pending” lists so multiple workers can share the load. Groups are scoped to a single stream, but a stream can have several groups (e.g., one for delivery, another for analytics). Within a group you can even have multiple consumers, each identified (like worker-1, worker-2). Redis tracks which consumer has claimed which entries and whether they acknowledged them.
+
+So:
+
+- Stream = storage/log per tenant (where messages live).
+- Consumer group = coordination metadata for readers of that stream (who has read what, what’s pending, who should retry).
+
+You need both: the stream stores notifications, and the consumer group tells Redis how to fan those notifications out reliably among your worker processes.
 
 
 BRO — **CLOSE YOUR EYES FOR 30 SECONDS**  
@@ -482,6 +510,174 @@ redis-cli
 
 > XPENDING notifications:ethindia-2024 fanout-group-ethindia-2024
 → 0 (all delivered)
+```
+
+---
+
+## Architecture Diagram (2 Tenants)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         MAIN API SERVER (index.js)                          │
+│                         Port: 3003                                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Express API                                                         │   │
+│  │  • POST /notify/:hackathonId                                         │   │
+│  │  • Socket.io Server (manages connections)                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│                              │ (creates jobs)                                │
+│                              ▼                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Tenant-Specific BullMQ Queues                                      │   │
+│  │  • notifications-ethindia-2024                                      │   │
+│  │  • notifications-tinkerquest-2025                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  GLOBAL SUBSCRIBER (Redis Pub/Sub)                                  │   │
+│  │  • Channel: 'notifications:delivered'                               │   │
+│  │  • Listens to ALL tenants' delivery ACKs                           │   │
+│  │  • Updates PostgreSQL delivery_count                               │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ (Socket.io Redis Adapter)
+                              │
+┌─────────────────────────────┴─────────────────────────────────────────────┐
+│                              REDIS                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │  BULLMQ QUEUES (Job Processing)                                   │   │
+│  │  ┌──────────────────────┐  ┌──────────────────────┐              │   │
+│  │  │ notifications-       │  │ notifications-       │              │   │
+│  │  │ ethindia-2024        │  │ tinkerquest-2025     │              │   │
+│  │  └──────────────────────┘  └──────────────────────┘              │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │  REDIS STREAMS (Backpressure/Retry)                              │   │
+│  │  ┌──────────────────────┐  ┌──────────────────────┐              │   │
+│  │  │ notifications:       │  │ notifications:       │              │   │
+│  │  │ ethindia-2024        │  │ tinkerquest-2025     │              │   │
+│  │  │                      │  │                      │              │   │
+│  │  │ Consumer Group:      │  │ Consumer Group:      │              │   │
+│  │  │ fanout-group-        │  │ fanout-group-        │              │   │
+│  │  │ ethindia-2024        │  │ tinkerquest-2025     │              │   │
+│  │  └──────────────────────┘  └──────────────────────┘              │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │  PUB/SUB CHANNELS (Global ACKs)                                    │   │
+│  │  • notifications:delivered (GLOBAL - all tenants publish here)    │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │  SOCKET.IO REDIS ADAPTER                                           │   │
+│  │  • Enables Socket.io across multiple servers                       │   │
+│  │  • pubClient + subClient                                           │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ (consumes jobs, publishes ACKs)
+                              │
+┌─────────────────────────────┴─────────────────────────────────────────────┐
+│                      WORKER PROCESS (worker.js)                           │
+│                      Port: 3004                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │  TENANT 1: ETHINDIA-2024                                         │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐ │   │
+│  │  │ Worker: notifications-ethindia-2024                         │ │   │
+│  │  │ • Consumes from: notifications-ethindia-2024 queue          │ │   │
+│  │  │ • Writes to: notifications:ethindia-2024 stream             │ │   │
+│  │  │ • Consumer Group: fanout-group-ethindia-2024                │ │   │
+│  │  │ • Concurrency: 20 parallel fan-outs                         │ │   │
+│  │  └─────────────────────────────────────────────────────────────┘ │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │  TENANT 2: TINKERQUEST-2025                                       │   │
+│  │  ┌─────────────────────────────────────────────────────────────┐ │   │
+│  │  │ Worker: notifications-tinkerquest-2025                      │ │   │
+│  │  │ • Consumes from: notifications-tinkerquest-2025 queue       │ │   │
+│  │  │ • Writes to: notifications:tinkerquest-2025 stream          │ │   │
+│  │  │ • Consumer Group: fanout-group-tinkerquest-2025             │ │   │
+│  │  │ • Concurrency: 20 parallel fan-outs                         │ │   │
+│  │  └─────────────────────────────────────────────────────────────┘ │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │  Socket.io Server (Worker)                                        │   │
+│  │  • Fan-out to users via WebSocket                                 │   │
+│  │  • Uses Redis adapter for multi-server support                   │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│                              │ (publishes delivery ACK)                      │
+│                              ▼                                               │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │  PUBLISHER (Redis Pub/Sub)                                        │   │
+│  │  • Publishes to: 'notifications:delivered'                       │   │
+│  │  • Payload: { notificationId, hackathonId, userId }             │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ (queries users, updates delivery)
+                              │
+┌─────────────────────────────┴─────────────────────────────────────────────┐
+│                         POSTGRESQL DATABASE                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────┐   │
+│  │  Tables (Tenant-Isolated)                                          │   │
+│  │  • notifications (hackathon_id, message, type, delivered_count)   │   │
+│  │  • users (hackathon_id, socket_id)                                │   │
+│  └───────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              │
+                              │ (WebSocket connections)
+                              │
+┌─────────────────────────────┴─────────────────────────────────────────────┐
+│                            FRONTEND CLIENTS                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────────────────────────┐  ┌─────────────────────────────────┐│
+│  │  ETHINDIA-2024 USERS             │  │  TINKERQUEST-2025 USERS          ││
+│  │  • Socket.io connected           │  │  • Socket.io connected           ││
+│  │  • Room: ethindia-2024           │  │  • Room: tinkerquest-2025        ││
+│  │  • Receives notifications        │  │  • Receives notifications        ││
+│  └──────────────────────────────────┘  └─────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+FLOW FOR ONE NOTIFICATION (ETHINDIA-2024):
+
+1. POST /notify/ethindia-2024
+   └─> Main API Server
+       ├─> Saves to PostgreSQL (notifications table)
+       └─> Adds job to BullMQ queue: notifications-ethindia-2024
+
+2. Worker picks up job from notifications-ethindia-2024 queue
+   └─> Worker Process (notifications-ethindia-2024 worker)
+       ├─> Queries PostgreSQL: SELECT users WHERE hackathon_id = 'ethindia-2024'
+       ├─> Fan-out via Socket.io to all users in room 'ethindia-2024'
+       ├─> Writes to Redis Stream: notifications:ethindia-2024
+       └─> Publishes ACK: redis.publish('notifications:delivered', {...})
+
+3. Global Subscriber (in Main API Server) receives ACK
+   └─> Updates PostgreSQL: delivered_count++
+
+KEY POINTS:
+• Each tenant has its OWN queue, stream, and consumer group
+• Global subscriber listens to ALL tenants' delivery ACKs
+• Workers are per-tenant but can run in same process
+• Socket.io rooms isolate tenants (ethindia-2024 vs tinkerquest-2025)
+• Redis Streams provide backpressure/retry per tenant
+• Pub/Sub is GLOBAL for cross-process communication
 ```
 
 --

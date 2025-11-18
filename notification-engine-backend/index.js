@@ -8,6 +8,7 @@ import { Pool } from 'pg';
 import Redis from 'ioredis';
 import { Queue } from 'bullmq';
 
+
 const app = express();
 app.use(express.json()); // Parse JSON request bodies
 const server = createServer(app);

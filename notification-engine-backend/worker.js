@@ -37,6 +37,9 @@ hackathons.forEach(hackathonId => {
   redis.xgroup('CREATE', streamKey, consumerGroup, '$', 'MKSTREAM').catch(() => {});
 
   
+
+
+  
   const worker = new Worker(`notifications-${hackathonId}`, async (job) => {
     console.log(`Processing job ${job.id} for hackathon ${hackathonId}`);
     const { notificationId, hackathonId, message, type } = job.data;
